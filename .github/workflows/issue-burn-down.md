@@ -20,6 +20,9 @@ safe-outputs:
     title-prefix: "[burndown] "
     labels: [report, burndown]
     close-older-issues: true
+tools:
+  github:
+    min-integrity: none
 ---
 
 # Adoptium Issue Burn-down Report
