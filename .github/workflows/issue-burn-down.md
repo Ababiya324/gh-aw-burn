@@ -12,6 +12,15 @@ permissions:
   issues: read
   pull-requests: read
   copilot-requests: write
+tools:
+  github:
+    min-integrity: none
+  bash:
+    - "gh"
+    - "jq"
+    - "date"
+    - "sleep"
+    - "echo"
 network:
   allowed:
     - defaults
@@ -20,50 +29,72 @@ safe-outputs:
     title-prefix: "[burndown] "
     labels: [report, burndown]
     close-older-issues: true
-tools:
-  github:
-    min-integrity: none
 ---
-
 # Adoptium Issue Burn-down Report
-
 Create a single quarterly issue burn-down report covering the public repositories in the **adoptium** GitHub organization, posted as one GitHub issue in this repository.
-
 ## Scope
-
 - Look across the public repositories in the `adoptium` organization, not just this one.
 - Cover a custom date range (default: the last full calendar quarter relative to today). Count issues only — exclude pull requests.
-
 ## What to include
-
 - For each repository: issues opened in the period, issues closed in the period, a burn-down score (`closed - opened`, where negative means the backlog is growing), and the count of stale open issues (no activity in the last 30 days).
 - Up to 5 stale issues per repository, listed with title, link, and last-updated date, ordered most-stale first.
 - An org-level list of the top 10 potentially under-served labels — labels where open issues outpace closed issues — with their open/closed counts.
+## Tooling and data handling (important — avoid large JSON payloads)
+Perform every GitHub read with the `gh` CLI, which is already authenticated in the runner. Do **not** use the github MCP search tools for tallies: they return full issue objects that bloat the context window and previously caused both oversized-JSON failures and malformed tool calls. The `gh api` approach below reads only a single count per query, so issue bodies never enter the context.
 
+Rules:
+- Read counts from the search endpoint's `total_count` field with `--jq '.total_count'`. Never download issue lists to obtain a count.
+- The authenticated search API is limited to 30 requests per minute. Pace your queries — insert a short `sleep` between calls if you approach that rate — and stop querying a repository as soon as a single count shows it has no activity in the period.
+- Run one small command at a time. Keep any intermediate output small and validate it with `jq` before relying on it.
 ## Process
+1. Determine the reporting window. Default to the last full calendar quarter relative to today. Compute `START` and `END` (as `YYYY-MM-DD`, the first and last day of that quarter) and `STALE` (the date 30 days before today):
+```bash
+STALE=$(date -u -d '30 days ago' +%Y-%m-%d)
+```
+2. Enumerate active public repositories in `adoptium`, skipping archived repositories and any with issues disabled:
+```bash
+gh api --paginate 'orgs/adoptium/repos?per_page=100&type=public' \
+  --jq '.[] | select(.archived == false and .has_issues == true) | .name'
+```
+3. For each repository `NAME`, read the three tallies using `total_count` only:
+```bash
+# issues opened in the period
+gh api -X GET search/issues \
+  -f q="repo:adoptium/$NAME is:issue created:$START..$END" \
+  -f per_page=1 --jq '.total_count'
 
-1. Enumerate the public repositories in the `adoptium` organization.
-2. For each repository, gather issues opened and closed during the reporting period, identify stale open issues, and tally label counts (open vs. closed) for issues opened in the period.
-3. Rank repositories by stale issue count, descending.
-4. Aggregate label stats across all repositories and rank by `open - closed`, descending, keeping the top 10.
-5. Create a single GitHub issue in this repository containing the full report: period covered, per-repo summary (sorted by stale count), and the under-served labels list.
+# issues closed in the period
+gh api -X GET search/issues \
+  -f q="repo:adoptium/$NAME is:issue closed:$START..$END" \
+  -f per_page=1 --jq '.total_count'
 
-## Data handling (important — avoid large JSON payloads)
+# stale open issues (no activity in the last 30 days)
+gh api -X GET search/issues \
+  -f q="repo:adoptium/$NAME is:issue is:open updated:<$STALE" \
+  -f per_page=1 --jq '.total_count'
+```
+   If all three counts are zero, skip the repository entirely and issue no further queries for it.
+4. For each repository that has stale open issues, list up to 5, oldest-activity first, selecting only the fields the report uses:
+```bash
+gh api -X GET search/issues \
+  -f q="repo:adoptium/$NAME is:issue is:open updated:<$STALE" \
+  -f sort=updated -f order=asc -f per_page=5 \
+  --jq '.items[] | {title: .title, url: .html_url, updated: .updated_at}'
+```
+5. For label statistics, query the open and closed counts per candidate label rather than aggregating full issue data:
+```bash
+gh api -X GET search/issues \
+  -f q="repo:adoptium/$NAME is:issue is:open label:\"$LABEL\"" \
+  -f per_page=1 --jq '.total_count'
 
-Previous runs failed with "Unable to process large JSON file for issues due to invalid structure" when fetching bulk issue data. To avoid this:
-
-- Never fetch or write the full issue list of a repository (or the whole org) into a single file or a single API response. Work repo-by-repo, one small request at a time.
-- Prefer the GitHub **search** API with date-range qualifiers and read `total_count` for tallies instead of downloading issue bodies. Examples:
-  - opened in period: `repo:adoptium/<name> is:issue created:<start>..<end>`
-  - closed in period: `repo:adoptium/<name> is:issue closed:<start>..<end>`
-  - stale open: `repo:adoptium/<name> is:issue is:open updated:<=<30-days-ago>`
-- For the up-to-5 stale issues per repo, request only what you need: search sorted by `updated` ascending with `per_page=5`, and select only the fields you use (title, url, updated date).
-- For label stats, use search counts per label (`label:"<label>" created:<start>..<end>` with `is:open` / `is:closed`) on the most common labels, rather than aggregating from full issue dumps.
-- Skip archived repositories and repositories with zero issue activity in the period as early as possible (a single count query) so you never fetch their data.
-- Keep any intermediate files you write small (well under 1 MB) and validate JSON with `jq` before relying on it. If a response is truncated or fails to parse, retry that one small query — do not fall back to a bulk download.
-
+gh api -X GET search/issues \
+  -f q="repo:adoptium/$NAME is:issue is:closed label:\"$LABEL\"" \
+  -f per_page=1 --jq '.total_count'
+```
+6. Compute the per-repository burn-down score (`closed - opened`), rank repositories by stale-issue count descending, aggregate label open/closed counts across all repositories, rank by `open - closed` descending, and keep the top 10.
+7. Create a single GitHub issue in this repository containing the full report: the period covered, the per-repository summary (sorted by stale count), and the under-served labels list.
 ## Constraints
-
+- Do not spawn sub-agents or use any task-delegation tool. Perform all analysis yourself in a single sequential pass, processing one repository at a time.
 - Read-only: do not close, comment on, or relabel any issue you analyze — this workflow only produces a report.
 - Create exactly one issue.
 - Skip any repository with zero issues in the period rather than listing it with empty stats.
